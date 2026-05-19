@@ -10,11 +10,13 @@
 #include <Storages/TimeSeries/PrometheusQueryToSQL/SelectQueryBuilder.h>
 #include <Storages/TimeSeries/PrometheusQueryToSQL/dropMetricName.h>
 #include <Storages/TimeSeries/timeSeriesTypesToAST.h>
+#include <cmath>
 
 
 namespace DB::ErrorCodes
 {
     extern const int CANNOT_EXECUTE_PROMQL_QUERY;
+    extern const int NOT_IMPLEMENTED;
 }
 
 
@@ -46,11 +48,212 @@ namespace
         }
     }
 
+    enum class SimpleOverTimeFunction
+    {
+        None,
+        Sum,
+        Avg,
+        Min,
+        Max,
+        Count,
+        Stddev,
+        Stdvar,
+        Present,
+    };
+
+    void checkPredictLinearArgumentTypes(const std::vector<SQLQueryPiece> & arguments, const ConverterContext & context)
+    {
+        std::string_view function_name = "predict_linear";
+        if (arguments.size() != 2)
+        {
+            throw Exception(ErrorCodes::CANNOT_EXECUTE_PROMQL_QUERY,
+                            "Function '{}' expects 2 arguments, but was called with {} arguments",
+                            function_name, arguments.size());
+        }
+
+        const auto & range_arg = arguments[0];
+        if (range_arg.type != ResultType::RANGE_VECTOR)
+        {
+            throw Exception(ErrorCodes::CANNOT_EXECUTE_PROMQL_QUERY,
+                            "Function '{}' expects first argument of type {}, but expression {} has type {}",
+                            function_name, ResultType::RANGE_VECTOR,
+                            getPromQLText(range_arg, context), range_arg.type);
+        }
+
+        const auto & scalar_arg = arguments[1];
+        if (scalar_arg.type != ResultType::SCALAR)
+        {
+            throw Exception(ErrorCodes::CANNOT_EXECUTE_PROMQL_QUERY,
+                            "Function '{}' expects second argument of type {}, but expression {} has type {}",
+                            function_name, ResultType::SCALAR,
+                            getPromQLText(scalar_arg, context), scalar_arg.type);
+        }
+    }
+
+    void checkQuantileOverTimeArgumentTypes(const std::vector<SQLQueryPiece> & arguments, const ConverterContext & context)
+    {
+        std::string_view function_name = "quantile_over_time";
+        if (arguments.size() != 2)
+        {
+            throw Exception(ErrorCodes::CANNOT_EXECUTE_PROMQL_QUERY,
+                            "Function '{}' expects 2 arguments, but was called with {} arguments",
+                            function_name, arguments.size());
+        }
+
+        const auto & phi_arg = arguments[0];
+        if (phi_arg.type != ResultType::SCALAR)
+        {
+            throw Exception(ErrorCodes::CANNOT_EXECUTE_PROMQL_QUERY,
+                            "Function '{}' expects first argument of type {}, but expression {} has type {}",
+                            function_name, ResultType::SCALAR,
+                            getPromQLText(phi_arg, context), phi_arg.type);
+        }
+
+        const auto & range_arg = arguments[1];
+        if (range_arg.type != ResultType::RANGE_VECTOR)
+        {
+            throw Exception(ErrorCodes::CANNOT_EXECUTE_PROMQL_QUERY,
+                            "Function '{}' expects second argument of type {}, but expression {} has type {}",
+                            function_name, ResultType::RANGE_VECTOR,
+                            getPromQLText(range_arg, context), range_arg.type);
+        }
+    }
+
+    ASTPtr getScalarParameter(SQLQueryPiece && scalar_arg, std::string_view function_name, ConverterContext & context)
+    {
+        switch (scalar_arg.store_method)
+        {
+            case StoreMethod::CONST_SCALAR:
+            {
+                return timeSeriesScalarToAST(scalar_arg.scalar_value, context.scalar_data_type);
+            }
+            case StoreMethod::SINGLE_SCALAR:
+            {
+                context.subqueries.emplace_back(SQLSubquery{context.subqueries.size(), std::move(scalar_arg.select_query), SQLSubqueryType::SCALAR});
+                auto subquery_id = make_intrusive<ASTIdentifier>(context.subqueries.back().name);
+                /// Wrap with `assumeNotNull` because scalar subqueries make their result nullable,
+                /// but StoreMethod::SINGLE_SCALAR always means one row.
+                return makeASTFunction("assumeNotNull", std::move(subquery_id));
+            }
+            case StoreMethod::SCALAR_GRID:
+            {
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                                "Function '{}' with a non-constant scalar parameter is not supported",
+                                function_name);
+            }
+            default:
+            {
+                throwUnexpectedStoreMethod(scalar_arg, context);
+            }
+        }
+    }
+
+    enum class PostProcessFunction
+    {
+        None,
+        Increase,
+        Deriv,
+    };
+
     struct ImplInfo
     {
         std::string_view ch_function_name;
         bool drop_metric_name = true;
+        SimpleOverTimeFunction simple_over_time_function = SimpleOverTimeFunction::None;
+        PostProcessFunction post_process_function = PostProcessFunction::None;
     };
+
+    ASTPtr toFloat64(ASTPtr && x)
+    {
+        return makeASTFunction("toFloat64", std::move(x));
+    }
+
+    ASTPtr getTupleElement(ASTPtr && tuple, UInt64 index)
+    {
+        return makeASTFunction("tupleElement", std::move(tuple), make_intrusive<ASTLiteral>(index));
+    }
+
+    ASTPtr buildWindowSamples(ASTPtr grid_timestamp, ASTPtr timestamps, ASTPtr values, ASTPtr window)
+    {
+        auto sample_timestamp = [] { return getTupleElement(make_intrusive<ASTIdentifier>("p"), 1); };
+        auto sample_value = [] { return getTupleElement(make_intrusive<ASTIdentifier>("p"), 2); };
+
+        auto lower_bound = makeASTFunction("minus", toFloat64(grid_timestamp->clone()), toFloat64(window->clone()));
+        auto upper_bound = toFloat64(std::move(grid_timestamp));
+        auto filter_condition = makeASTFunction(
+            "and",
+            makeASTFunction("greater", toFloat64(sample_timestamp()), std::move(lower_bound)),
+            makeASTFunction("lessOrEquals", toFloat64(sample_timestamp()), std::move(upper_bound)),
+            makeASTFunction("isNotNull", sample_value()));
+
+        auto filtered_samples = makeASTFunction(
+            "arrayFilter",
+            makeASTLambda({"p"}, std::move(filter_condition)),
+            makeASTFunction("arrayZip", std::move(timestamps), std::move(values)));
+
+        return makeASTFunction(
+            "arrayMap",
+            makeASTLambda({"p"}, makeASTFunction("assumeNotNull", sample_value())),
+            std::move(filtered_samples));
+    }
+
+    ASTPtr buildSimpleOverTimeValue(SimpleOverTimeFunction function, ASTPtr samples, const ConverterContext & context)
+    {
+        switch (function)
+        {
+            case SimpleOverTimeFunction::Sum:
+                return makeASTFunction("arraySum", std::move(samples));
+            case SimpleOverTimeFunction::Avg:
+                return makeASTFunction("arrayAvg", std::move(samples));
+            case SimpleOverTimeFunction::Min:
+                return makeASTFunction("arrayMin", std::move(samples));
+            case SimpleOverTimeFunction::Max:
+                return makeASTFunction("arrayMax", std::move(samples));
+            case SimpleOverTimeFunction::Count:
+                return makeASTFunction("toFloat64", makeASTFunction("length", std::move(samples)));
+            case SimpleOverTimeFunction::Stddev:
+                return makeASTFunction("arrayReduce", make_intrusive<ASTLiteral>("stddevPop"), std::move(samples));
+            case SimpleOverTimeFunction::Stdvar:
+                return makeASTFunction("arrayReduce", make_intrusive<ASTLiteral>("varPop"), std::move(samples));
+            case SimpleOverTimeFunction::Present:
+                return timeSeriesScalarToAST(1, context.scalar_data_type);
+            case SimpleOverTimeFunction::None:
+                break;
+        }
+
+        UNREACHABLE();
+    }
+
+    ASTPtr buildSimpleOverTimeValues(
+        SimpleOverTimeFunction function,
+        ASTPtr timestamps,
+        ASTPtr values,
+        TimestampType start_time,
+        TimestampType end_time,
+        DurationType step,
+        DurationType window,
+        const ConverterContext & context)
+    {
+        auto grid_timestamp = make_intrusive<ASTIdentifier>("t");
+        auto window_ast = timeSeriesDurationToAST(window, context.timestamp_data_type);
+        auto samples = buildWindowSamples(grid_timestamp->clone(), timestamps->clone(), values->clone(), window_ast->clone());
+        auto has_no_samples = makeASTFunction("empty", samples->clone());
+        auto over_time_value = buildSimpleOverTimeValue(function, std::move(samples), context);
+        auto value = makeASTFunction(
+            "if",
+            std::move(has_no_samples),
+            make_intrusive<ASTLiteral>(Field{}),
+            std::move(over_time_value));
+
+        return makeASTFunction(
+            "arrayMap",
+            makeASTLambda({"t"}, std::move(value)),
+            makeASTFunction(
+                "timeSeriesRange",
+                timeSeriesTimestampToAST(start_time, context.timestamp_data_type),
+                timeSeriesTimestampToAST(end_time, context.timestamp_data_type),
+                timeSeriesDurationToAST(step, context.timestamp_data_type)));
+    }
 
     /// Returns information about how the specified prometheus function is implemented.
     /// Returns nullptr if not found.
@@ -75,6 +278,14 @@ namespace
                  /* drop_metric_name = */ true,
              }},
 
+            {"increase",
+             {
+                 "timeSeriesRateToGrid",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::None,
+                 PostProcessFunction::Increase,
+             }},
+
             {"idelta",
              {
                  "timeSeriesInstantDeltaToGrid",
@@ -87,19 +298,82 @@ namespace
                  /* drop_metric_name = */ false,
              }},
 
+            {"avg_over_time",
+             {
+                 "timeSeriesAvgOverTimeToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
+            {"min_over_time",
+             {
+                 "",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::Min,
+             }},
+
+            {"max_over_time",
+             {
+                 "timeSeriesMaxOverTimeToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
+            {"sum_over_time",
+             {
+                 "",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::Sum,
+             }},
+
+            {"count_over_time",
+             {
+                 "",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::Count,
+             }},
+
+            {"stddev_over_time",
+             {
+                 "",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::Stddev,
+             }},
+
+            {"stdvar_over_time",
+             {
+                 "",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::Stdvar,
+             }},
+
+            {"present_over_time",
+             {
+                 "",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::Present,
+             }},
+
+            {"changes",
+             {
+                 "timeSeriesChangesToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
+            {"resets",
+             {
+                 "timeSeriesResetsToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
+            {"deriv",
+             {
+                 "timeSeriesDerivToGrid",
+                 /* drop_metric_name = */ true,
+                 SimpleOverTimeFunction::None,
+                 PostProcessFunction::Deriv,
+             }},
+
             /// TODO:
-            /// resets
-            /// predict_linear
-            /// deriv
-            /// avg_over_time
-            /// min_over_time
-            /// max_over_time
-            /// sum_over_time
-            /// count_over_time
             /// quantile_over_time
-            /// stddev_over_time"
-            /// stdvar_over_time
-            /// present_over_time
             /// absent_over_time
             /// mad_over_time
             /// ts_of_min_over_time
@@ -120,7 +394,7 @@ namespace
 
 bool isFunctionOverRange(std::string_view function_name)
 {
-    return getImplInfo(function_name) != nullptr;
+    return (function_name == "quantile_over_time") || (function_name == "predict_linear") || (getImplInfo(function_name) != nullptr);
 }
 
 
@@ -138,26 +412,66 @@ SQLQueryPiece applyFunctionOverRange(
     ConverterContext & context)
 {
     const auto * impl_info = getImplInfo(function_name);
-    chassert(impl_info);
+    const bool is_quantile_over_time = function_name == "quantile_over_time";
+    const bool is_predict_linear = function_name == "predict_linear";
+    chassert(impl_info || is_quantile_over_time || is_predict_linear);
 
-    checkArgumentTypes(function_name, arguments, context);
+    std::string_view ch_function_name;
+    bool drop_metric_name = true;
+    size_t range_argument_index = 0;
+    ASTPtr extra_parameter;
+
+    if (is_quantile_over_time)
+    {
+        checkQuantileOverTimeArgumentTypes(arguments, context);
+        ch_function_name = "timeSeriesQuantileToGrid";
+        range_argument_index = 1;
+    }
+    else if (is_predict_linear)
+    {
+        checkPredictLinearArgumentTypes(arguments, context);
+        ch_function_name = "timeSeriesPredictLinearToGrid";
+        range_argument_index = 0;
+    }
+    else
+    {
+        checkArgumentTypes(function_name, arguments, context);
+        ch_function_name = impl_info->ch_function_name;
+        drop_metric_name = impl_info->drop_metric_name;
+    }
 
     auto node_range = context.node_range_getter.get(node);
     if (node_range.empty())
         return SQLQueryPiece{node, ResultType::INSTANT_VECTOR, StoreMethod::EMPTY};
+
+    if (is_quantile_over_time)
+    {
+        if (arguments[0].store_method == StoreMethod::EMPTY || arguments[1].store_method == StoreMethod::EMPTY)
+            return SQLQueryPiece{node, ResultType::INSTANT_VECTOR, StoreMethod::EMPTY};
+
+        extra_parameter = getScalarParameter(std::move(arguments[0]), function_name, context);
+    }
+    else if (is_predict_linear)
+    {
+        if (arguments[0].store_method == StoreMethod::EMPTY || arguments[1].store_method == StoreMethod::EMPTY)
+            return SQLQueryPiece{node, ResultType::INSTANT_VECTOR, StoreMethod::EMPTY};
+
+        extra_parameter = getScalarParameter(std::move(arguments[1]), function_name, context);
+    }
 
     auto start_time = node_range.start_time;
     auto end_time = node_range.end_time;
     auto step = node_range.step;
     auto window = node_range.window;
 
-    auto argument = std::move(arguments[0]);
+    auto argument = std::move(arguments[range_argument_index]);
 
     SQLQueryPiece res = argument;
     res.node = node;
     res.type = ResultType::INSTANT_VECTOR;
 
     bool has_group = false;
+    bool group_by_group = false;
     ASTPtr timestamps;
     ASTPtr values;
 
@@ -207,6 +521,9 @@ SQLQueryPiece applyFunctionOverRange(
             /// FROM <vector_grid>
             /// GROUP BY group
             has_group = true;
+            /// Quantile, regression, and aggregate-state range functions still aggregate after unpacking the grid.
+            /// Inline simple reducers map each row's packed grid in place and must not add GROUP BY.
+            group_by_group = !impl_info || (impl_info->simple_over_time_function == SimpleOverTimeFunction::None);
 
             /// (timeSeriesFromGrid(<start_time>, <end_time>, <step>, values) AS time_series).1
             ASTPtr ts = makeASTFunction(
@@ -232,9 +549,18 @@ SQLQueryPiece applyFunctionOverRange(
             /// FROM <raw_data>
             /// GROUP BY group
             has_group = true;
+            group_by_group = true;
 
-            timestamps = make_intrusive<ASTIdentifier>(ColumnNames::Timestamp);
-            values = make_intrusive<ASTIdentifier>(ColumnNames::Value);
+            if (impl_info && impl_info->simple_over_time_function != SimpleOverTimeFunction::None)
+            {
+                timestamps = makeASTFunction("groupArray", make_intrusive<ASTIdentifier>(ColumnNames::Timestamp));
+                values = makeASTFunction("groupArray", make_intrusive<ASTIdentifier>(ColumnNames::Value));
+            }
+            else
+            {
+                timestamps = make_intrusive<ASTIdentifier>(ColumnNames::Timestamp);
+                values = make_intrusive<ASTIdentifier>(ColumnNames::Value);
+            }
             res.store_method = StoreMethod::VECTOR_GRID;
 
             break;
@@ -265,17 +591,78 @@ SQLQueryPiece applyFunctionOverRange(
     if (has_group)
         builder.select_list.push_back(make_intrusive<ASTIdentifier>(ColumnNames::Group));
 
-    /// <aggregate_function>(<timestamps>, <values>) AS values
-    builder.select_list.push_back(addParametersToAggregateFunction(
-        makeASTFunction(impl_info->ch_function_name, std::move(timestamps), std::move(values)),
-        timeSeriesTimestampToAST(start_time, context.timestamp_data_type),
-        timeSeriesTimestampToAST(end_time, context.timestamp_data_type),
-        timeSeriesDurationToAST(step, context.timestamp_data_type),
-        timeSeriesDurationToAST(window, context.timestamp_data_type)));
+    ASTPtr result_values;
+    if (impl_info && impl_info->simple_over_time_function != SimpleOverTimeFunction::None)
+    {
+        result_values = buildSimpleOverTimeValues(
+            impl_info->simple_over_time_function,
+            std::move(timestamps),
+            std::move(values),
+            start_time,
+            end_time,
+            step,
+            window,
+            context);
+    }
+    else
+    {
+        /// <aggregate_function>(<timestamps>, <values>) AS values
+        auto aggregate_function = makeASTFunction(ch_function_name, std::move(timestamps), std::move(values));
+        if (extra_parameter)
+        {
+            result_values = addParametersToAggregateFunction(
+                std::move(aggregate_function),
+                timeSeriesTimestampToAST(start_time, context.timestamp_data_type),
+                timeSeriesTimestampToAST(end_time, context.timestamp_data_type),
+                timeSeriesDurationToAST(step, context.timestamp_data_type),
+                timeSeriesDurationToAST(window, context.timestamp_data_type),
+                std::move(extra_parameter));
+        }
+        else
+        {
+            result_values = addParametersToAggregateFunction(
+                std::move(aggregate_function),
+                timeSeriesTimestampToAST(start_time, context.timestamp_data_type),
+                timeSeriesTimestampToAST(end_time, context.timestamp_data_type),
+                timeSeriesDurationToAST(step, context.timestamp_data_type),
+                timeSeriesDurationToAST(window, context.timestamp_data_type));
+        }
+    }
 
+    if (impl_info && impl_info->post_process_function != PostProcessFunction::None)
+    {
+        ASTPtr factor;
+        if (impl_info->post_process_function == PostProcessFunction::Increase)
+        {
+            /// timeSeriesRateToGrid already implements Prometheus counter extrapolation;
+            /// increase() is that per-second rate scaled back to the requested range length.
+            factor = toFloat64(timeSeriesDurationToAST(window, context.timestamp_data_type));
+        }
+        else
+        {
+            /// timeSeriesDerivToGrid returns a slope per timestamp unit; PromQL deriv reports per-second slope.
+            factor = make_intrusive<ASTLiteral>(std::pow(10.0, context.timestamp_scale));
+        }
+
+        result_values = makeASTFunction(
+            "arrayMap",
+            makeASTLambda(
+                {"x"},
+                makeASTFunction(
+                    "if",
+                    makeASTFunction("isNull", make_intrusive<ASTIdentifier>("x")),
+                    make_intrusive<ASTLiteral>(Field{}),
+                    makeASTFunction(
+                        "multiply",
+                        make_intrusive<ASTIdentifier>("x"),
+                        std::move(factor)))),
+            std::move(result_values));
+    }
+
+    builder.select_list.push_back(std::move(result_values));
     builder.select_list.back()->setAlias(ColumnNames::Values);
 
-    if (has_group)
+    if (group_by_group)
         builder.group_by.push_back(make_intrusive<ASTIdentifier>(ColumnNames::Group));
 
     if (argument.select_query)
@@ -290,7 +677,7 @@ SQLQueryPiece applyFunctionOverRange(
     res.end_time = end_time;
     res.step = step;
 
-    if (has_group && impl_info->drop_metric_name)
+    if (has_group && drop_metric_name)
         res = dropMetricName(std::move(res), context);
 
     return res;

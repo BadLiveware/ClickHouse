@@ -1,16 +1,17 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 
-
-#include <DataTypes/DataTypesDecimal.h>
-#include <Columns/ColumnVector.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnVector.h>
 #include <Common/DequeWithMemoryTracking.h>
 #include <Common/VectorWithMemoryTracking.h>
+#include <DataTypes/DataTypesDecimal.h>
 
 #include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesBase.h>
 
@@ -20,11 +21,10 @@
 namespace DB
 {
 
-template <bool array_arguments_, typename TimestampType_, typename IntervalType_, typename ValueType_, bool is_resets_>
-struct AggregateFunctionTimeseriesChangesTraits
+template <bool array_arguments_, typename TimestampType_, typename IntervalType_, typename ValueType_>
+struct AggregateFunctionTimeseriesQuantileTraits
 {
     static constexpr bool array_arguments = array_arguments_;
-    static constexpr bool is_resets = is_resets_;
 
     using TimestampType = TimestampType_;
     using IntervalType = IntervalType_;
@@ -32,7 +32,7 @@ struct AggregateFunctionTimeseriesChangesTraits
 
     static String getName()
     {
-        return is_resets ? "timeSeriesResetsToGrid" : "timeSeriesChangesToGrid";
+        return "timeSeriesQuantileToGrid";
     }
 
     struct Bucket
@@ -43,14 +43,14 @@ struct AggregateFunctionTimeseriesChangesTraits
         {
             auto it = samples.find(timestamp);
             if (it != samples.end())
-                it->second = std::max(it->second, value);
+                it->second = std::fmax(it->second, value);
             else
                 samples[timestamp] = value;
         }
 
         void merge(const Bucket & other)
         {
-            samples.reserve(other.samples.size());
+            samples.reserve(samples.size() + other.samples.size());
 
             for (const auto & [timestamp, value] : other.samples)
                 add(timestamp, value);
@@ -59,23 +59,32 @@ struct AggregateFunctionTimeseriesChangesTraits
 };
 
 template <typename Traits>
-class AggregateFunctionTimeseriesChanges final :
-    public AggregateFunctionTimeseriesBase<AggregateFunctionTimeseriesChanges<Traits>, Traits>
+class AggregateFunctionTimeseriesQuantile final :
+    public AggregateFunctionTimeseriesBase<AggregateFunctionTimeseriesQuantile<Traits>, Traits>
 {
 public:
     static constexpr bool DateTime64Supported = true;
-
-    static constexpr bool is_resets = Traits::is_resets;
 
     using TimestampType = typename Traits::TimestampType;
     using IntervalType = typename Traits::IntervalType;
     using ValueType = typename Traits::ValueType;
 
-    using Base = AggregateFunctionTimeseriesBase<AggregateFunctionTimeseriesChanges<Traits>, Traits>;
-
-    using Base::Base;
+    using Base = AggregateFunctionTimeseriesBase<AggregateFunctionTimeseriesQuantile<Traits>, Traits>;
 
     using Bucket = typename Base::Bucket;
+
+    explicit AggregateFunctionTimeseriesQuantile(
+        const DataTypes & argument_types_,
+        TimestampType start_timestamp_,
+        TimestampType end_timestamp_,
+        IntervalType step_,
+        IntervalType window_,
+        UInt32 timestamp_scale_,
+        Float64 phi_)
+        : Base(argument_types_, start_timestamp_, end_timestamp_, step_, window_, timestamp_scale_)
+        , phi(phi_)
+    {
+    }
 
     static void serializeBucket(const Bucket & bucket, WriteBuffer & buf)
     {
@@ -90,7 +99,7 @@ public:
     void deserializeBucket(Bucket & bucket, ReadBuffer & buf, const size_t bucket_index) const
     {
         size_t sample_count;
-        readBinaryLittleEndian(sample_count,buf);
+        readBinaryLittleEndian(sample_count, buf);
         bucket.samples.reserve(sample_count);
 
         for (size_t s = 0; s < sample_count; ++s)
@@ -107,8 +116,22 @@ public:
     }
 
 private:
-    void fillResultValue(const DequeWithMemoryTracking<std::pair<TimestampType, ValueType>> & samples_in_window,
-        ValueType & result, UInt8 & null) const
+    static bool valueLess(ValueType lhs, ValueType rhs)
+    {
+        /// Prometheus sorts NaN before numeric samples before quantile interpolation.
+        /// Plain operator< would leave NaNs unordered.
+        const bool lhs_nan = std::isnan(lhs);
+        const bool rhs_nan = std::isnan(rhs);
+        if (lhs_nan || rhs_nan)
+            return lhs_nan && !rhs_nan;
+        return lhs < rhs;
+    }
+
+    void fillResultValue(
+        const DequeWithMemoryTracking<std::pair<TimestampType, ValueType>> & samples_in_window,
+        VectorWithMemoryTracking<ValueType> & values_buffer,
+        ValueType & result,
+        UInt8 & null) const
     {
         if (samples_in_window.empty())
         {
@@ -117,33 +140,46 @@ private:
             return;
         }
 
-        UInt64 count = 0;
-        ValueType prev_sample_value = samples_in_window.front().second;
-        for (const auto& sample : samples_in_window)
+        if (std::isnan(phi))
         {
-            if constexpr (is_resets)
-            {
-                bool is_reset = (sample.second < prev_sample_value);
-                if (is_reset)
-                    count++;
-            }
-            else
-            {
-                /// PromQL changes() treats consecutive NaN samples as the same value.
-                bool is_change = (sample.second != prev_sample_value)
-                    && !(std::isnan(sample.second) && std::isnan(prev_sample_value));
-                if (is_change)
-                    count++;
-            }
-            prev_sample_value = sample.second;
+            result = std::numeric_limits<ValueType>::quiet_NaN();
+            null = 0;
+            return;
+        }
+        if (phi < 0)
+        {
+            result = -std::numeric_limits<ValueType>::infinity();
+            null = 0;
+            return;
+        }
+        if (phi > 1)
+        {
+            result = std::numeric_limits<ValueType>::infinity();
+            null = 0;
+            return;
         }
 
-        result = static_cast<ValueType>(count);
+        values_buffer.clear();
+        values_buffer.reserve(samples_in_window.size());
+        for (const auto & sample : samples_in_window)
+            values_buffer.push_back(sample.second);
+
+        std::sort(values_buffer.begin(), values_buffer.end(), valueLess);
+
+        const Float64 n = static_cast<Float64>(values_buffer.size());
+        const Float64 rank = phi * (n - 1);
+        const auto lower_index = static_cast<size_t>(std::max(0.0, std::floor(rank)));
+        const auto upper_index = static_cast<size_t>(std::min(n - 1, static_cast<Float64>(lower_index + 1)));
+        const Float64 weight = rank - std::floor(rank);
+
+        result = static_cast<ValueType>(
+            static_cast<Float64>(values_buffer[lower_index]) * (1 - weight)
+            + static_cast<Float64>(values_buffer[upper_index]) * weight);
         null = 0;
     }
 
 public:
-    /// Insert the result into the column
+    /// Insert the result into the column.
     void doInsertResultInto(AggregateDataPtr __restrict place, IColumn & to) const
     {
         ColumnArray & arr_to = typeid_cast<ColumnArray &>(to);
@@ -171,45 +207,43 @@ public:
 
         DequeWithMemoryTracking<std::pair<TimestampType, ValueType>> samples_in_window;
         VectorWithMemoryTracking<std::pair<TimestampType, ValueType>> timestamps_buffer;
+        VectorWithMemoryTracking<ValueType> values_buffer;
 
-
-        /// Fill the data for missing buckets
+        /// Fill the data for missing buckets.
         for (UInt32 i = 0; i < Base::bucket_count; ++i)
         {
-            /// Use `Base::timestampAtIndex` to compute the grid timestamp with overflow-safe
-            /// arithmetic. The plain expression `Base::start_timestamp + i * Base::step`
-            /// signed-overflows `TimestampType` when `step` is near `INT64_MAX` and `i >= 2`
-            /// (reachable from adversarial fuzzer inputs), which trips UBSAN.
-            const TimestampType current_timestamp = Base::timestampAtIndex(i);
+            const TimestampType current_timestamp = Base::start_timestamp + i * Base::step;
 
             auto bucket_it = buckets.find(i);
             if (bucket_it != buckets.end())
             {
                 timestamps_buffer.clear();
-                /// Sort samples from the current bucket
+                /// Sort samples from the current bucket.
                 for (const auto & [timestamp, value] : bucket_it->second.samples)
                     timestamps_buffer.emplace_back(timestamp, value);
                 std::sort(timestamps_buffer.begin(), timestamps_buffer.end());
 
-                /// Add samples from the current bucket
+                /// Add samples from the current bucket.
                 for (const auto & [timestamp, value] : timestamps_buffer)
                     samples_in_window.push_back({timestamp, value});
             }
 
-            /// Remove samples that are out of the window
+            /// Remove samples that are out of the window.
             while (!samples_in_window.empty() && samples_in_window.front().first + Base::window <= current_timestamp)
-            {
                 samples_in_window.pop_front();
-            }
 
             fillResultValue(
                 samples_in_window,
+                values_buffer,
                 values[i],
                 nulls[i]);
         }
     }
 
     static constexpr UInt16 FORMAT_VERSION = 1;
+
+protected:
+    const Float64 phi{};
 };
 
 }

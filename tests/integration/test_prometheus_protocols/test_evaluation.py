@@ -1,7 +1,10 @@
+import json
+import math
+
 import pytest
 
 from helpers.cluster import ClickHouseCluster
-from helpers.test_tools import tsv_close_to
+from helpers.test_tools import TSV, tsv_close_to
 from .prometheus_test_utils import *
 
 
@@ -187,6 +190,74 @@ def send_test_data():
     send_data(
         [
             (
+                {"__name__": "counter_values", "job": "counter"},
+                {
+                    100: 0,
+                    110: 1,
+                    120: 3,
+                    130: 2,
+                    140: 4,
+                    190: 5,
+                    200: 1,
+                    210: 2,
+                },
+            ),
+            (
+                {"__name__": "special_counter_values", "case": "nan-inf"},
+                {
+                    100: 1,
+                    110: math.nan,
+                    120: math.nan,
+                    130: math.inf,
+                    140: math.inf,
+                    150: -math.inf,
+                },
+            ),
+        ]
+    )
+
+    send_data(
+        [
+            (
+                {"__name__": "quantile_special", "case": "nan-inf"},
+                {
+                    100: 1,
+                    110: math.nan,
+                    120: math.nan,
+                    130: math.inf,
+                    140: math.inf,
+                    150: -math.inf,
+                },
+            ),
+        ]
+    )
+
+    send_data(
+        [
+            (
+                {"__name__": "special_values", "job": "special"},
+                {
+                    100: float("nan"),
+                    110: float("inf"),
+                    120: float("-inf"),
+                    130: 0,
+                },
+            ),
+            (
+                {"__name__": "range_special", "job": "special"},
+                {
+                    100: float("nan"),
+                    110: float("inf"),
+                    120: float("-inf"),
+                    130: 0,
+                },
+            ),
+        ]
+    )
+
+    send_data(
+        [
+            (
                 {"__name__": "http_errors", "http_code": "401"},
                 {
                     150: 0,
@@ -206,6 +277,71 @@ def send_test_data():
                     130: 0,
                     150: 1,
                 },
+            ),
+        ]
+    )
+
+    send_data(
+        [
+            (
+                {"__name__": "request_duration_seconds_bucket", "instance": "a", "job": "api", "le": "1"},
+                {100: 10, 160: 20},
+            ),
+            (
+                {"__name__": "request_duration_seconds_bucket", "instance": "a", "job": "api", "le": "2"},
+                {100: 20, 160: 40},
+            ),
+            (
+                {"__name__": "request_duration_seconds_bucket", "instance": "a", "job": "api", "le": "+Inf"},
+                {100: 20, 160: 40},
+            ),
+            (
+                {"__name__": "request_duration_seconds_bucket", "instance": "b", "job": "api", "le": "1"},
+                {100: 5, 160: 15},
+            ),
+            (
+                {"__name__": "request_duration_seconds_bucket", "instance": "b", "job": "api", "le": "2"},
+                {100: 10, 160: 30},
+            ),
+            (
+                {"__name__": "request_duration_seconds_bucket", "instance": "b", "job": "api", "le": "+Inf"},
+                {100: 10, 160: 30},
+            ),
+            (
+                {"__name__": "request_duration_no_inf_bucket", "job": "api", "le": "1"},
+                {160: 1},
+            ),
+            (
+                {"__name__": "request_duration_no_inf_bucket", "job": "api", "le": "2"},
+                {160: 2},
+            ),
+            (
+                {"__name__": "request_duration_mixed_bucket", "job": "api", "le": "1"},
+                {160: 1},
+            ),
+            (
+                {"__name__": "request_duration_mixed_bucket", "job": "api", "le": "NaN"},
+                {160: 100},
+            ),
+            (
+                {"__name__": "request_duration_mixed_bucket", "job": "api", "le": "bad"},
+                {160: 100},
+            ),
+            (
+                {"__name__": "request_duration_mixed_bucket", "job": "api", "le": "+Inf"},
+                {160: 2},
+            ),
+            (
+                {"__name__": "request_duration_duplicate_bound_bucket", "job": "api", "le": "1"},
+                {160: 10},
+            ),
+            (
+                {"__name__": "request_duration_duplicate_bound_bucket", "job": "api", "le": "1.0"},
+                {160: 20},
+            ),
+            (
+                {"__name__": "request_duration_duplicate_bound_bucket", "job": "api", "le": "+Inf"},
+                {160: 40},
             ),
         ]
     )
@@ -265,7 +401,9 @@ def do_query_test(
     clickhouse_http_api_result_is_same_as_prometheus=True,
     eps=0,
 ):
-    assert execute_query_in_prometheus(query, timestamp) == result
+    assert http_api_response_close_to(
+        execute_query_in_prometheus(query, timestamp), result, eps=eps
+    )
 
     actual_chresult = execute_query_in_clickhouse_sql(query, timestamp)
     assert tsv_close_to(
@@ -276,6 +414,76 @@ def do_query_test(
     assert (
         http_api_response_close_to(actual_result_from_http_api, result, eps=eps)
         == clickhouse_http_api_result_is_same_as_prometheus
+    ), f"actual_result_from_http_api: {actual_result_from_http_api}, expected: {result}"
+
+
+def normalized_result_order(response):
+    data = json.loads(response)
+    if data.get("resultType") in ("vector", "matrix"):
+        data["result"] = sorted(
+            data["result"],
+            key=lambda item: json.dumps(item.get("metric", {}), sort_keys=True),
+        )
+    return data
+
+
+def tsv_close_to_ignoring_row_order(result, expected, eps=0):
+    return tsv_close_to(
+        sorted(TSV(result).lines), sorted(TSV(expected).lines), eps=eps
+    )
+
+
+def do_query_test_ignoring_result_order(query, timestamp, result, chresult, eps=0):
+    assert normalized_result_order(
+        execute_query_in_prometheus(query, timestamp)
+    ) == normalized_result_order(result)
+
+    actual_chresult = execute_query_in_clickhouse_sql(query, timestamp)
+    assert tsv_close_to_ignoring_row_order(
+        actual_chresult, chresult, eps=eps
+    ), f"actual result: {actual_chresult}, expected: {chresult}"
+
+    actual_result_from_http_api = execute_query_in_clickhouse_http_api(query, timestamp)
+    assert normalized_result_order(actual_result_from_http_api) == normalized_result_order(
+        result
+    ), f"actual_result_from_http_api: {actual_result_from_http_api}, expected: {result}"
+
+
+def _result_with_series_sorted(response):
+    data = json.loads(response)
+    if data.get("resultType") in ("vector", "matrix"):
+        data["result"].sort(
+            key=lambda series: json.dumps(series.get("metric", {}), sort_keys=True)
+        )
+    return data
+
+
+# Evaluates a query whose Prometheus vector/matrix series order is nondeterministic.
+def do_unordered_query_test(query, timestamp, result, chresult):
+    expected_result = _result_with_series_sorted(result)
+    assert (
+        _result_with_series_sorted(execute_query_in_prometheus_reader(query, timestamp))
+        == expected_result
+    )
+    assert (
+        _result_with_series_sorted(
+            execute_query_in_prometheus_receiver(query, timestamp)
+        )
+        == expected_result
+    )
+
+    actual_chresult = execute_query_in_clickhouse_sql(query, timestamp)
+    actual_chresult_sorted = TSV(actual_chresult)
+    actual_chresult_sorted.lines.sort()
+    expected_chresult_sorted = TSV(chresult)
+    expected_chresult_sorted.lines.sort()
+    assert (
+        actual_chresult_sorted == expected_chresult_sorted
+    ), f"actual result: {actual_chresult}, expected: {chresult}"
+
+    actual_result_from_http_api = execute_query_in_clickhouse_http_api(query, timestamp)
+    assert (
+        _result_with_series_sorted(actual_result_from_http_api) == expected_result
     ), f"actual_result_from_http_api: {actual_result_from_http_api}, expected: {result}"
 
 
@@ -433,6 +641,30 @@ def test_range_selectors():
         ],
     )
 
+    do_query_test(
+        "(test offset 30s)[40:10]",
+        180,
+        '{"resultType": "matrix", "result": [{"metric": {"__name__": "test"}, "values": [[150, "1"], [160, "3"], [170, "4"], [180, "4"]]}]}',
+        [
+            [
+                "[('__name__','test')]",
+                "[('1970-01-01 00:02:30.000',1),('1970-01-01 00:02:40.000',3),('1970-01-01 00:02:50.000',4),('1970-01-01 00:03:00.000',4)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "(test @ 140)[40:10]",
+        180,
+        '{"resultType": "matrix", "result": [{"metric": {"__name__": "test"}, "values": [[150, "4"], [160, "4"], [170, "4"], [180, "4"]]}]}',
+        [
+            [
+                "[('__name__','test')]",
+                "[('1970-01-01 00:02:30.000',4),('1970-01-01 00:02:40.000',4),('1970-01-01 00:02:50.000',4),('1970-01-01 00:03:00.000',4)]",
+            ]
+        ],
+    )
+
 
 def test_instant_selectors():
     do_query_test(
@@ -475,6 +707,148 @@ def test_instant_selectors():
     )
 
 
+def test_label_functions():
+    do_query_test(
+        'label_replace(foo{shape="square"}, "kind", "$1-kind", "shape", "(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "kind": "square-kind", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('kind','square-kind'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "size", "$1", "shape", "(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "square", "size": "square"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('shape','square'),('size','square')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "kind", "value-$1", "missing", "source-(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "shape", "", "size", "(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "kind", "$2-$1", "shape", "(squ)(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "kind": "are-squ", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('kind','are-squ'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "__name__", "renamed_$1", "shape", "(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "renamed_square", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','renamed_square'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "metric_copy", "${1}_metric", "__name__", "(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "metric_copy": "foo_metric", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('metric_copy','foo_metric'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "~valid_utf8", "$1", "shape", "(.*)")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "square", "size": "s", "~valid_utf8": "square"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('shape','square'),('size','s'),('~valid_utf8','square')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_replace(foo{shape="square"}, "kind", "empty-$0", "", "")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "kind": "empty-", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('kind','empty-'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_join(foo{shape="square"}, "joined", ":", "shape", "size")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "joined": "square:s", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('joined','square:s'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_join(foo{shape="square"}, "shape", "-", "size", "missing")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "s-", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('shape','s-'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_join(foo{shape="square"}, "joined", "/", "missing1", "missing2")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "joined": "/", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('joined','/'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_join(foo{shape="square"}, "__name__", "_", "shape", "size")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "square_s", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','square_s'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_query_test(
+        'label_join(foo{shape="square"}, "joined", "/", "__name__", "shape")',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "joined": "foo/square", "shape": "square", "size": "s"}, "value": [130, "40"]}]}',
+        [["[('__name__','foo'),('joined','foo/square'),('shape','square'),('size','s')]", "1970-01-01 00:02:10.000", 40]],
+    )
+
+    do_range_query_test(
+        'label_join(foo{shape="square"}, "joined", ":", "shape", "size")',
+        110,
+        130,
+        10,
+        '{"resultType": "matrix", "result": [{"metric": {"__name__": "foo", "joined": "square:s", "shape": "square", "size": "s"}, "values": [[110, "4"], [120, "4"], [130, "40"]]}]}',
+        [
+            [
+                "[('__name__','foo'),('joined','square:s'),('shape','square'),('size','s')]",
+                "[('1970-01-01 00:01:50.000',4),('1970-01-01 00:02:00.000',4),('1970-01-01 00:02:10.000',40)]",
+            ]
+        ],
+    )
+
+    do_query_test_expect_error(
+        'label_replace(foo{shape="square"}, "", "$1", "shape", "(.*)")',
+        130,
+        "invalid destination label name in label_replace()",
+        "invalid destination label name in label_replace()",
+    )
+
+    do_query_test_expect_error(
+        'label_replace(foo{shape="square"}, "kind", "$1", "shape", "(.*")',
+        130,
+        "invalid regular expression in label_replace(): (.*",
+        "invalid regular expression in label_replace(): (.*",
+    )
+
+    do_query_test_expect_error(
+        'label_join(foo{shape="square"}, "", ":", "shape")',
+        130,
+        "invalid destination label name in label_join()",
+        "invalid destination label name in label_join()",
+    )
+
+    do_query_test_expect_error(
+        'label_join(foo{shape="square"}, "joined", ":", "")',
+        130,
+        "invalid source label name in label_join()",
+        "invalid source label name in label_join()",
+    )
+
+
 def test_function_over_time():
     do_query_test(
         "last_over_time(test[45s])[120s:15s]",
@@ -484,6 +858,328 @@ def test_function_over_time():
             [
                 "[('__name__','test')]",
                 "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',3),('1970-01-01 00:02:30.000',4),('1970-01-01 00:02:45.000',4),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',8)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "quantile_over_time(0.5, test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "1"], [135, "1"], [150, "2"], [165, "3.5"], [180, "4"], [195, "5"], [210, "5"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',2),('1970-01-01 00:02:45.000',3.5),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',5)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "quantile_over_time(-1, test[45s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [150, "-Inf"]}]}',
+        [["[]", "1970-01-01 00:02:30.000", "-inf"]],
+    )
+
+    do_query_test(
+        "quantile_over_time(2, test[45s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [150, "+Inf"]}]}',
+        [["[]", "1970-01-01 00:02:30.000", "inf"]],
+    )
+
+    do_query_test(
+        "quantile_over_time(NaN, test[45s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [150, "NaN"]}]}',
+        [["[]", "1970-01-01 00:02:30.000", "nan"]],
+    )
+
+    do_query_test(
+        "quantile_over_time(0.5, test[5s])",
+        180,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        "quantile_over_time(0.5, quantile_special[60s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"case": "nan-inf"}, "value": [150, "-Inf"]}]}',
+        [["[('case','nan-inf')]", "1970-01-01 00:02:30.000", "-inf"]],
+    )
+
+    do_query_test(
+        "quantile_over_time(1, quantile_special[60s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"case": "nan-inf"}, "value": [150, "NaN"]}]}',
+        [["[('case','nan-inf')]", "1970-01-01 00:02:30.000", "nan"]],
+    )
+
+    do_query_test(
+        "quantile_over_time(scalar(vector(0.5)), test[45s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [150, "2"]}]}',
+        [["[]", "1970-01-01 00:02:30.000", 2]],
+    )
+
+    do_query_test(
+        "quantile_over_time(0.5, test[45s:15s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [150, "3"]}]}',
+        [["[]", "1970-01-01 00:02:30.000", 3]],
+    )
+
+    do_range_query_test(
+        "quantile_over_time(0.5, test[45s])",
+        120,
+        210,
+        15,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "1"], [135, "1"], [150, "2"], [165, "3.5"], [180, "4"], [195, "5"], [210, "5"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',2),('1970-01-01 00:02:45.000',3.5),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',5)]",
+            ]
+        ],
+    )
+
+    expected_error = "Function 'quantile_over_time' with a non-constant scalar parameter is not supported"
+    assert expected_error in execute_query_in_clickhouse_sql(
+        "quantile_over_time(time() / 200, test[45s])[60s:15s]",
+        150,
+        expect_error=True,
+    )
+    assert expected_error in execute_query_in_clickhouse_http_api(
+        "quantile_over_time(time() / 200, test[45s])[60s:15s]",
+        150,
+        expect_error=True,
+    )
+
+    do_query_test(
+        "changes(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "0"], [135, "1"], [150, "2"], [165, "1"], [180, "0"], [195, "0"], [210, "1"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',2),('1970-01-01 00:02:45.000',1),('1970-01-01 00:03:00.000',0),('1970-01-01 00:03:15.000',0),('1970-01-01 00:03:30.000',1)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "resets(counter_values[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {"job": "counter"}, "values": [[105, "0"], [120, "0"], [135, "1"], [150, "1"], [165, "0"], [180, "0"], [195, "0"], [210, "1"]]}]}',
+        [
+            [
+                "[('job','counter')]",
+                "[('1970-01-01 00:01:45.000',0),('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',1),('1970-01-01 00:02:45.000',0),('1970-01-01 00:03:00.000',0),('1970-01-01 00:03:15.000',0),('1970-01-01 00:03:30.000',1)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "changes(test[5s])",
+        180,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        "changes(special_counter_values[60s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"case": "nan-inf"}, "value": [150, "3"]}]}',
+        [["[('case','nan-inf')]", "1970-01-01 00:02:30.000", 3]],
+    )
+
+    do_query_test(
+        "resets(special_counter_values[60s])",
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"case": "nan-inf"}, "value": [150, "1"]}]}',
+        [["[('case','nan-inf')]", "1970-01-01 00:02:30.000", 1]],
+    )
+
+    do_query_test(
+        "resets(no_such_metric[45s])",
+        210,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_range_query_test(
+        "changes(test[45s])",
+        120,
+        210,
+        15,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "0"], [135, "1"], [150, "2"], [165, "1"], [180, "0"], [195, "0"], [210, "1"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',2),('1970-01-01 00:02:45.000',1),('1970-01-01 00:03:00.000',0),('1970-01-01 00:03:15.000',0),('1970-01-01 00:03:30.000',1)]",
+            ]
+        ],
+    )
+
+    do_range_query_test(
+        "resets(counter_values[45s])",
+        120,
+        210,
+        15,
+        '{"resultType": "matrix", "result": [{"metric": {"job": "counter"}, "values": [[120, "0"], [135, "1"], [150, "1"], [165, "0"], [180, "0"], [195, "0"], [210, "1"]]}]}',
+        [
+            [
+                "[('job','counter')]",
+                "[('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',1),('1970-01-01 00:02:45.000',0),('1970-01-01 00:03:00.000',0),('1970-01-01 00:03:15.000',0),('1970-01-01 00:03:30.000',1)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "sum_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "2"], [135, "5"], [150, "9"], [165, "7"], [180, "4"], [195, "5"], [210, "18"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',2),('1970-01-01 00:02:15.000',5),('1970-01-01 00:02:30.000',9),('1970-01-01 00:02:45.000',7),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',18)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "avg_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "1"], [135, "1.6666666666666667"], [150, "2.25"], [165, "3.5"], [180, "4"], [195, "5"], [210, "6"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',1.6666666666666667),('1970-01-01 00:02:30.000',2.25),('1970-01-01 00:02:45.000',3.5),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',6)]",
+            ]
+        ],
+        eps=1e-9,
+    )
+
+    do_query_test(
+        "min_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "1"], [135, "1"], [150, "1"], [165, "3"], [180, "4"], [195, "5"], [210, "5"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',1),('1970-01-01 00:02:45.000',3),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',5)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "max_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "1"], [135, "3"], [150, "4"], [165, "4"], [180, "4"], [195, "5"], [210, "8"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',3),('1970-01-01 00:02:30.000',4),('1970-01-01 00:02:45.000',4),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',8)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "count_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "2"], [135, "3"], [150, "4"], [165, "2"], [180, "1"], [195, "1"], [210, "3"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',2),('1970-01-01 00:02:15.000',3),('1970-01-01 00:02:30.000',4),('1970-01-01 00:02:45.000',2),('1970-01-01 00:03:00.000',1),('1970-01-01 00:03:15.000',1),('1970-01-01 00:03:30.000',3)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "stddev_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "0"], [135, "0.9428090415820634"], [150, "1.299038105676658"], [165, "0.5"], [180, "0"], [195, "0"], [210, "1.4142135623730951"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',0.9428090415820634),('1970-01-01 00:02:30.000',1.299038105676658),('1970-01-01 00:02:45.000',0.5),('1970-01-01 00:03:00.000',0),('1970-01-01 00:03:15.000',0),('1970-01-01 00:03:30.000',1.4142135623730951)]",
+            ]
+        ],
+        eps=1e-9,
+    )
+
+    do_query_test(
+        "stdvar_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "0"], [135, "0.888888888888889"], [150, "1.6875000000000002"], [165, "0.25"], [180, "0"], [195, "0"], [210, "2"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',0.8888888888888888),('1970-01-01 00:02:30.000',1.6875),('1970-01-01 00:02:45.000',0.25),('1970-01-01 00:03:00.000',0),('1970-01-01 00:03:15.000',0),('1970-01-01 00:03:30.000',2)]",
+            ]
+        ],
+        eps=1e-9,
+    )
+
+    do_query_test(
+        "present_over_time(test[45s])[120s:15s]",
+        210,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "1"], [135, "1"], [150, "1"], [165, "1"], [180, "1"], [195, "1"], [210, "1"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:15.000',1),('1970-01-01 00:02:30.000',1),('1970-01-01 00:02:45.000',1),('1970-01-01 00:03:00.000',1),('1970-01-01 00:03:15.000',1),('1970-01-01 00:03:30.000',1)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "sum_over_time(test[5s])",
+        180,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        "sum_over_time(no_such_metric[45s])",
+        210,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        "max_over_time(range_special[30s])",
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"job": "special"}, "value": [130, "+Inf"]}]}',
+        [["[('job','special')]", "1970-01-01 00:02:10.000", "inf"]],
+    )
+
+    do_query_test(
+        "min_over_time(range_special[30s])",
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"job": "special"}, "value": [130, "-Inf"]}]}',
+        [["[('job','special')]", "1970-01-01 00:02:10.000", "-inf"]],
+    )
+
+    do_query_test(
+        "count_over_time(range_special[40s])",
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"job": "special"}, "value": [130, "4"]}]}',
+        [["[('job','special')]", "1970-01-01 00:02:10.000", 4]],
+    )
+
+    do_range_query_test(
+        "sum_over_time(test[45s])",
+        120,
+        210,
+        15,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[120, "2"], [135, "5"], [150, "9"], [165, "7"], [180, "4"], [195, "5"], [210, "18"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:00.000',2),('1970-01-01 00:02:15.000',5),('1970-01-01 00:02:30.000',9),('1970-01-01 00:02:45.000',7),('1970-01-01 00:03:00.000',4),('1970-01-01 00:03:15.000',5),('1970-01-01 00:03:30.000',18)]",
             ]
         ],
     )
@@ -558,6 +1254,207 @@ def test_function_over_time():
                 "[('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:15.000',2),('1970-01-01 00:02:30.000',1),('1970-01-01 00:03:30.000',3)]",
             ]
         ],
+    )
+
+
+def test_absent_functions():
+    do_query_test(
+        "absent(test)",
+        130,
+        '{"resultType": "vector", "result": []}',
+        [],
+    )
+
+    do_query_test(
+        "absent(nonexistent_metric)",
+        130,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [130, "1"]}]}',
+        [["[]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_query_test(
+        'absent(foo{shape="hexagon", size="xl"})',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"shape": "hexagon", "size": "xl"}, "value": [130, "1"]}]}',
+        [["[('shape','hexagon'),('size','xl')]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_query_test(
+        'absent(foo{shape=~"hex.*"})',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [130, "1"]}]}',
+        [["[]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_query_test(
+        'absent(nonexistent_metric{shape!="square"})',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [130, "1"]}]}',
+        [["[]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_query_test(
+        'sum(absent(foo{shape="hexagon"}))',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [130, "1"]}]}',
+        [["[]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_range_query_test(
+        'absent(foo{shape="hexagon"})',
+        110,
+        130,
+        10,
+        '{"resultType": "matrix", "result": [{"metric": {"shape": "hexagon"}, "values": [[110, "1"], [120, "1"], [130, "1"]]}]}',
+        [
+            [
+                "[('shape','hexagon')]",
+                "[('1970-01-01 00:01:50.000',1),('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:10.000',1)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "absent_over_time(test[20s])",
+        140,
+        '{"resultType": "vector", "result": []}',
+        [],
+    )
+
+    do_query_test(
+        "absent_over_time(test[20s])",
+        170,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [170, "1"]}]}',
+        [["[]", "1970-01-01 00:02:50.000", 1]],
+    )
+
+    do_query_test(
+        'absent_over_time(test{job="missing"}[20s])',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"job": "missing"}, "value": [130, "1"]}]}',
+        [["[('job','missing')]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_query_test(
+        'absent_over_time(test{job=~"missing"}[20s])',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [130, "1"]}]}',
+        [["[]", "1970-01-01 00:02:10.000", 1]],
+    )
+
+    do_range_query_test(
+        "absent_over_time(test[20s])",
+        130,
+        190,
+        10,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[160, "1"], [170, "1"], [180, "1"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:40.000',1),('1970-01-01 00:02:50.000',1),('1970-01-01 00:03:00.000',1)]",
+            ]
+        ],
+    )
+
+
+def test_function_histogram_quantile():
+    do_unordered_query_test(
+        "histogram_quantile(0.9, request_duration_seconds_bucket)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {"instance": "a", "job": "api"}, "value": [160, "1.8"]}, {"metric": {"instance": "b", "job": "api"}, "value": [160, "1.8"]}]}',
+        [
+            ["[('instance','a'),('job','api')]", "1970-01-01 00:02:40.000", 1.8],
+            ["[('instance','b'),('job','api')]", "1970-01-01 00:02:40.000", 1.8],
+        ],
+    )
+
+    do_query_test(
+        "histogram_quantile(0.9, sum by (job, le) (rate(request_duration_seconds_bucket[2m])))",
+        170,
+        '{"resultType": "vector", "result": [{"metric": {"job": "api"}, "value": [170, "1.8"]}]}',
+        [["[('job','api')]", "1970-01-01 00:02:50.000", 1.8]],
+        eps=1e-9,
+    )
+
+    do_query_test(
+        "histogram_quantile(0.9, test)",
+        160,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        "histogram_quantile(0.5, request_duration_no_inf_bucket)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {"job": "api"}, "value": [160, "NaN"]}]}',
+        [["[('job','api')]", "1970-01-01 00:02:40.000", "nan"]],
+    )
+
+    do_query_test(
+        "histogram_quantile(-0.5, request_duration_no_inf_bucket)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {"job": "api"}, "value": [160, "-Inf"]}]}',
+        [["[('job','api')]", "1970-01-01 00:02:40.000", "-inf"]],
+    )
+
+    do_query_test(
+        "histogram_quantile(1.5, request_duration_no_inf_bucket)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {"job": "api"}, "value": [160, "+Inf"]}]}',
+        [["[('job','api')]", "1970-01-01 00:02:40.000", "inf"]],
+    )
+
+    do_query_test(
+        "histogram_quantile(0.5, request_duration_mixed_bucket)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {"job": "api"}, "value": [160, "NaN"]}]}',
+        [["[('job','api')]", "1970-01-01 00:02:40.000", "nan"]],
+    )
+
+    do_query_test(
+        "histogram_quantile(0.5, request_duration_duplicate_bound_bucket)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {"job": "api"}, "value": [160, "0.6666666666666666"]}]}',
+        [["[('job','api')]", "1970-01-01 00:02:40.000", 0.6666666666666666]],
+    )
+
+    assert http_api_response_close_to(
+        execute_range_query_in_prometheus(
+            "histogram_quantile(0.9, sum by (job, le) (rate(request_duration_seconds_bucket[2m])))",
+            160,
+            170,
+            10,
+        ),
+        '{"resultType": "matrix", "result": [{"metric": {"job": "api"}, "values": [[160, "1.8"], [170, "1.8"]]}]}',
+        eps=1e-9,
+    )
+
+    actual_chresult = execute_range_query_in_clickhouse_sql(
+        "histogram_quantile(0.9, sum by (job, le) (rate(request_duration_seconds_bucket[2m])))",
+        160,
+        170,
+        10,
+    )
+    assert tsv_close_to(
+        actual_chresult,
+        [
+            [
+                "[('job','api')]",
+                "[('1970-01-01 00:02:40.000',1.8),('1970-01-01 00:02:50.000',1.8)]",
+            ]
+        ],
+        eps=1e-9,
+    ), f"actual result: {actual_chresult}"
+
+    assert http_api_response_close_to(
+        execute_range_query_in_clickhouse_http_api(
+            "histogram_quantile(0.9, sum by (job, le) (rate(request_duration_seconds_bucket[2m])))",
+            160,
+            170,
+            10,
+        ),
+        '{"resultType": "matrix", "result": [{"metric": {"job": "api"}, "values": [[160, "1.8"], [170, "1.8"]]}]}',
+        eps=1e-9,
     )
 
 
@@ -751,6 +1648,37 @@ def test_conversion_functions():
     )
 
     do_query_test(
+        "timestamp(vector(1))[40:10]",
+        180,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[150, "150"], [160, "160"], [170, "170"], [180, "180"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:30.000',150),('1970-01-01 00:02:40.000',160),('1970-01-01 00:02:50.000',170),('1970-01-01 00:03:00.000',180)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "timestamp(test)",
+        160,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [160, "140"]}]}',
+        [["[]", "1970-01-01 00:02:40.000", 140]],
+    )
+
+    do_query_test(
+        "timestamp(test)[40:10]",
+        180,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[150, "140"], [160, "140"], [170, "140"], [180, "140"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:30.000',140),('1970-01-01 00:02:40.000',140),('1970-01-01 00:02:50.000',140),('1970-01-01 00:03:00.000',140)]",
+            ]
+        ],
+    )
+
+    do_query_test(
         "scalar(vector(1))",
         180,
         '{"resultType": "scalar", "result": [180, "1"]}',
@@ -789,6 +1717,30 @@ def test_conversion_functions():
             [
                 "[]",
                 "[('1970-01-01 00:01:50.000',1),('1970-01-01 00:02:00.000',5),('1970-01-01 00:02:10.000',0),('1970-01-01 00:02:20.000',nan),('1970-01-01 00:02:30.000',1),('1970-01-01 00:02:40.000',nan),('1970-01-01 00:02:50.000',nan),('1970-01-01 00:03:00.000',nan)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "vector(scalar(nonexistent_metric))[40:10]",
+        180,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[150, "NaN"], [160, "NaN"], [170, "NaN"], [180, "NaN"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:02:30.000',nan),('1970-01-01 00:02:40.000',nan),('1970-01-01 00:02:50.000',nan),('1970-01-01 00:03:00.000',nan)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "vector(scalar({__name__=~'foo|bar'}))[50:10]",
+        150,
+        '{"resultType": "matrix", "result": [{"metric": {}, "values": [[110, "NaN"], [120, "NaN"], [130, "NaN"], [140, "NaN"], [150, "NaN"]]}]}',
+        [
+            [
+                "[]",
+                "[('1970-01-01 00:01:50.000',nan),('1970-01-01 00:02:00.000',nan),('1970-01-01 00:02:10.000',nan),('1970-01-01 00:02:20.000',nan),('1970-01-01 00:02:30.000',nan)]",
             ]
         ],
     )
@@ -1035,6 +1987,34 @@ def test_math_functions():
                 "[('1970-01-01 00:01:40.000',-2),('1970-01-01 00:03:20.000',-1),('1970-01-01 00:05:00.000',-0),('1970-01-01 00:06:40.000',0),('1970-01-01 00:08:20.000',1),('1970-01-01 00:10:00.000',1),('1970-01-01 00:11:40.000',2)]",
             ]
         ],
+    )
+
+    do_query_test(
+        "round(vector(5), 2)",
+        500,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [500, "6"]}]}',
+        [["[]", "1970-01-01 00:08:20.000", 6]],
+    )
+
+    do_query_test(
+        "clamp_min(vector(2), NaN)",
+        500,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [500, "NaN"]}]}',
+        [["[]", "1970-01-01 00:08:20.000", "nan"]],
+    )
+
+    do_query_test(
+        "clamp_max(vector(2), NaN)",
+        500,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [500, "NaN"]}]}',
+        [["[]", "1970-01-01 00:08:20.000", "nan"]],
+    )
+
+    do_query_test(
+        "clamp(vector(2), 0, NaN)",
+        500,
+        '{"resultType": "vector", "result": [{"metric": {}, "value": [500, "NaN"]}]}',
+        [["[]", "1970-01-01 00:08:20.000", "nan"]],
     )
 
     do_query_test(
@@ -1568,6 +2548,155 @@ def test_alignment_with_subquery_step():
     )
 
 
+def test_set_binary_operators():
+    do_query_test(
+        'foo{shape="circle"} and bar{shape="circle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "circle", "size": "l"}, "value": [150, "16"]}]}',
+        [["[('__name__','foo'),('shape','circle'),('size','l')]", "1970-01-01 00:02:30.000", 16]],
+    )
+
+    do_query_test(
+        'foo{shape="triangle"} and bar{shape="triangle"}',
+        150,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        'foo{shape="triangle"} and on(shape) bar{shape="triangle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "triangle", "size": "m"}, "value": [150, "80"]}]}',
+        [["[('__name__','foo'),('shape','triangle'),('size','m')]", "1970-01-01 00:02:30.000", 80]],
+    )
+
+    do_query_test(
+        'foo{shape="triangle"} and ignoring(size) bar{shape="triangle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "triangle", "size": "m"}, "value": [150, "80"]}]}',
+        [["[('__name__','foo'),('shape','triangle'),('size','m')]", "1970-01-01 00:02:30.000", 80]],
+    )
+
+    do_query_test(
+        'foo{shape="circle"} and on(__name__, shape, size) bar{shape="circle"}',
+        150,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        'foo{shape="circle"} and on(size) bar',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "circle", "size": "l"}, "value": [150, "16"]}]}',
+        [["[('__name__','foo'),('shape','circle'),('size','l')]", "1970-01-01 00:02:30.000", 16]],
+    )
+
+    do_query_test(
+        'foo{shape="circle"} unless bar{shape="circle"}',
+        150,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test(
+        'foo{shape="triangle"} unless bar{shape="triangle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "triangle", "size": "m"}, "value": [150, "80"]}]}',
+        [["[('__name__','foo'),('shape','triangle'),('size','m')]", "1970-01-01 00:02:30.000", 80]],
+    )
+
+    do_query_test(
+        'foo{shape="circle"} or bar{shape="circle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "circle", "size": "l"}, "value": [150, "16"]}]}',
+        [["[('__name__','foo'),('shape','circle'),('size','l')]", "1970-01-01 00:02:30.000", 16]],
+    )
+
+    do_query_test_ignoring_result_order(
+        'foo{shape="circle"} or on(__name__, shape, size) bar{shape="circle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "circle", "size": "l"}, "value": [150, "16"]}, {"metric": {"__name__": "bar", "shape": "circle", "size": "l"}, "value": [150, "1000"]}]}',
+        [
+            ["[('__name__','foo'),('shape','circle'),('size','l')]", "1970-01-01 00:02:30.000", 16],
+            ["[('__name__','bar'),('shape','circle'),('size','l')]", "1970-01-01 00:02:30.000", 1000],
+        ],
+    )
+
+    do_query_test_ignoring_result_order(
+        'foo{shape="triangle"} or bar{shape="triangle"}',
+        150,
+        '{"resultType": "vector", "result": [{"metric": {"__name__": "foo", "shape": "triangle", "size": "m"}, "value": [150, "80"]}, {"metric": {"__name__": "bar", "shape": "triangle", "size": "xl"}, "value": [150, "30"]}]}',
+        [
+            ["[('__name__','foo'),('shape','triangle'),('size','m')]", "1970-01-01 00:02:30.000", 80],
+            ["[('__name__','bar'),('shape','triangle'),('size','xl')]", "1970-01-01 00:02:30.000", 30],
+        ],
+    )
+
+    do_query_test(
+        "foo and no_such_metric",
+        150,
+        '{"resultType": "vector", "result": []}',
+        "",
+    )
+
+    do_query_test_expect_error(
+        "foo and 1",
+        150,
+        "set operator \\\"and\\\" not allowed in binary scalar expression",
+        "Set binary operator 'and' expects two arguments of type INSTANT_VECTOR",
+    )
+
+    do_query_test_expect_error(
+        "foo and on(shape) group_left bar",
+        150,
+        "no grouping allowed for \\\"and\\\" operation",
+        "Set binary operator 'and' does not support group modifiers",
+    )
+
+    do_query_test_expect_error(
+        "foo and bool bar",
+        150,
+        "bool modifier can only be used on comparison operators",
+        "while parsing PromQL query: foo and bool bar",
+    )
+
+    do_query_test(
+        "(last_over_time(foo[10]) and last_over_time(bar[10]))[50:10]",
+        150,
+        '{"resultType": "matrix", "result": [{"metric": {"__name__": "foo", "shape": "circle", "size": "l"}, "values": [[110, "16"], [130, "16"], [150, "16"]]}, {"metric": {"__name__": "foo", "shape": "square", "size": "s"}, "values": [[110, "4"]]}]}',
+        [
+            [
+                "[('__name__','foo'),('shape','circle'),('size','l')]",
+                "[('1970-01-01 00:01:50.000',16),('1970-01-01 00:02:10.000',16),('1970-01-01 00:02:30.000',16)]",
+            ],
+            ["[('__name__','foo'),('shape','square'),('size','s')]", "[('1970-01-01 00:01:50.000',4)]"],
+        ],
+    )
+
+    do_query_test(
+        "(last_over_time(foo[10]) unless last_over_time(bar[10]))[50:10]",
+        150,
+        '{"resultType": "matrix", "result": [{"metric": {"__name__": "foo", "shape": "square", "size": "s"}, "values": [[130, "40"]]}, {"metric": {"__name__": "foo", "shape": "triangle", "size": "m"}, "values": [[110, "8"], [120, "80"]]}]}',
+        [
+            ["[('__name__','foo'),('shape','square'),('size','s')]", "[('1970-01-01 00:02:10.000',40)]"],
+            [
+                "[('__name__','foo'),('shape','triangle'),('size','m')]",
+                "[('1970-01-01 00:01:50.000',8),('1970-01-01 00:02:00.000',80)]",
+            ],
+        ],
+    )
+
+    do_query_test_ignoring_result_order(
+        '(last_over_time(foo{shape="circle"}[10]) or last_over_time(bar{shape="circle"}[10]))[50:10]',
+        150,
+        '{"resultType": "matrix", "result": [{"metric": {"__name__": "foo", "shape": "circle", "size": "l"}, "values": [[110, "16"], [130, "16"], [150, "16"]]}, {"metric": {"__name__": "bar", "shape": "circle", "size": "l"}, "values": [[120, "16"]]}]}',
+        [
+            ["[('__name__','foo'),('shape','circle'),('size','l')]", "[('1970-01-01 00:01:50.000',16),('1970-01-01 00:02:10.000',16),('1970-01-01 00:02:30.000',16)]"],
+            ["[('__name__','bar'),('shape','circle'),('size','l')]", "[('1970-01-01 00:02:00.000',16)]"],
+        ],
+    )
+
+
 def test_math_binary_operators():
     do_query_test(
         "5 + 7",
@@ -1690,6 +2819,42 @@ def test_math_binary_operators():
             [
                 "[('job','test')]",
                 "[('1970-01-01 00:01:40.000',-4),('1970-01-01 00:03:20.000',-2),('1970-01-01 00:05:00.000',-1),('1970-01-01 00:06:40.000',0),('1970-01-01 00:08:20.000',1),('1970-01-01 00:10:00.000',2),('1970-01-01 00:11:40.000',4)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "(special_values + 1)[30:10]",
+        130,
+        '{"resultType": "matrix", "result": [{"metric": {"job": "special"}, "values": [[110, "+Inf"], [120, "-Inf"], [130, "1"]]}]}',
+        [
+            [
+                "[('job','special')]",
+                "[('1970-01-01 00:01:50.000',inf),('1970-01-01 00:02:00.000',-inf),('1970-01-01 00:02:10.000',1)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "(special_values > bool 0)[30:10]",
+        130,
+        '{"resultType": "matrix", "result": [{"metric": {"job": "special"}, "values": [[110, "1"], [120, "0"], [130, "0"]]}]}',
+        [
+            [
+                "[('job','special')]",
+                "[('1970-01-01 00:01:50.000',1),('1970-01-01 00:02:00.000',0),('1970-01-01 00:02:10.000',0)]",
+            ]
+        ],
+    )
+
+    do_query_test(
+        "(special_values == bool special_values)[30:10]",
+        130,
+        '{"resultType": "matrix", "result": [{"metric": {"job": "special"}, "values": [[110, "1"], [120, "1"], [130, "1"]]}]}',
+        [
+            [
+                "[('job','special')]",
+                "[('1970-01-01 00:01:50.000',1),('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:10.000',1)]",
             ]
         ],
     )
@@ -2435,6 +3600,127 @@ def test_aggregation_operators():
             ["[('size','s')]", "[('1970-01-01 00:01:50.000',1),('1970-01-01 00:02:00.000',1),('1970-01-01 00:02:20.000',1)]"],
             ["[('size','xl')]", "[('1970-01-01 00:01:50.000',1),('1970-01-01 00:02:30.000',1)]"],
         ],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", foo)',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"value": "16"}, "value": [130, "1"]}, {"metric": {"value": "40"}, "value": [130, "1"]}, {"metric": {"value": "80"}, "value": [130, "1"]}]}',
+        [
+            ["[('value','16')]", "1970-01-01 00:02:10.000", 1],
+            ["[('value','40')]", "1970-01-01 00:02:10.000", 1],
+            ["[('value','80')]", "1970-01-01 00:02:10.000", 1],
+        ],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", {__name__=~"foo|bar"})',
+        110,
+        '{"resultType": "vector", "result": [{"metric": {"value": "10"}, "value": [110, "1"]}, {"metric": {"value": "16"}, "value": [110, "1"]}, {"metric": {"value": "3"}, "value": [110, "1"]}, {"metric": {"value": "4"}, "value": [110, "1"]}, {"metric": {"value": "8"}, "value": [110, "2"]}, {"metric": {"value": "9"}, "value": [110, "1"]}]}',
+        [
+            ["[('value','10')]", "1970-01-01 00:01:50.000", 1],
+            ["[('value','16')]", "1970-01-01 00:01:50.000", 1],
+            ["[('value','3')]", "1970-01-01 00:01:50.000", 1],
+            ["[('value','4')]", "1970-01-01 00:01:50.000", 1],
+            ["[('value','8')]", "1970-01-01 00:01:50.000", 2],
+            ["[('value','9')]", "1970-01-01 00:01:50.000", 1],
+        ],
+    )
+
+    do_unordered_query_test(
+        'count_values("shape", {__name__=~"foo|bar"}) by (shape)',
+        110,
+        '{"resultType": "vector", "result": [{"metric": {"shape": "10"}, "value": [110, "1"]}, {"metric": {"shape": "16"}, "value": [110, "1"]}, {"metric": {"shape": "3"}, "value": [110, "1"]}, {"metric": {"shape": "4"}, "value": [110, "1"]}, {"metric": {"shape": "8"}, "value": [110, "2"]}, {"metric": {"shape": "9"}, "value": [110, "1"]}]}',
+        [
+            ["[('shape','10')]", "1970-01-01 00:01:50.000", 1],
+            ["[('shape','16')]", "1970-01-01 00:01:50.000", 1],
+            ["[('shape','3')]", "1970-01-01 00:01:50.000", 1],
+            ["[('shape','4')]", "1970-01-01 00:01:50.000", 1],
+            ["[('shape','8')]", "1970-01-01 00:01:50.000", 2],
+            ["[('shape','9')]", "1970-01-01 00:01:50.000", 1],
+        ],
+    )
+
+    do_unordered_query_test(
+        '(count_values("value", last_over_time(foo[1s])))[20:10]',
+        130,
+        '{"resultType": "matrix", "result": [{"metric": {"value": "16"}, "values": [[130, "1"]]}, {"metric": {"value": "40"}, "values": [[130, "1"]]}, {"metric": {"value": "80"}, "values": [[120, "1"]]}]}',
+        [
+            ["[('value','16')]", "[('1970-01-01 00:02:10.000',1)]"],
+            ["[('value','40')]", "[('1970-01-01 00:02:10.000',1)]"],
+            ["[('value','80')]", "[('1970-01-01 00:02:00.000',1)]"],
+        ],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", foo) without (shape)',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"size": "l", "value": "16"}, "value": [130, "1"]}, {"metric": {"size": "m", "value": "80"}, "value": [130, "1"]}, {"metric": {"size": "s", "value": "40"}, "value": [130, "1"]}]}',
+        [
+            ["[('size','l'),('value','16')]", "1970-01-01 00:02:10.000", 1],
+            ["[('size','m'),('value','80')]", "1970-01-01 00:02:10.000", 1],
+            ["[('size','s'),('value','40')]", "1970-01-01 00:02:10.000", 1],
+        ],
+    )
+
+    do_unordered_query_test(
+        'count_values("size", foo) without (shape)',
+        130,
+        '{"resultType": "vector", "result": [{"metric": {"size": "16"}, "value": [130, "1"]}, {"metric": {"size": "40"}, "value": [130, "1"]}, {"metric": {"size": "80"}, "value": [130, "1"]}]}',
+        [
+            ["[('size','16')]", "1970-01-01 00:02:10.000", 1],
+            ["[('size','40')]", "1970-01-01 00:02:10.000", 1],
+            ["[('size','80')]", "1970-01-01 00:02:10.000", 1],
+        ],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", vector(1.5))',
+        120,
+        '{"resultType": "vector", "result": [{"metric": {"value": "1.5"}, "value": [120, "1"]}]}',
+        [["[('value','1.5')]", "1970-01-01 00:02:00.000", 1]],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", vector(+Inf))',
+        120,
+        '{"resultType": "vector", "result": [{"metric": {"value": "+Inf"}, "value": [120, "1"]}]}',
+        [["[('value','+Inf')]", "1970-01-01 00:02:00.000", 1]],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", vector(-Inf))',
+        120,
+        '{"resultType": "vector", "result": [{"metric": {"value": "-Inf"}, "value": [120, "1"]}]}',
+        [["[('value','-Inf')]", "1970-01-01 00:02:00.000", 1]],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", vector(NaN))',
+        120,
+        '{"resultType": "vector", "result": [{"metric": {"value": "NaN"}, "value": [120, "1"]}]}',
+        [["[('value','NaN')]", "1970-01-01 00:02:00.000", 1]],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", vector(0.0000001))',
+        120,
+        '{"resultType": "vector", "result": [{"metric": {"value": "0.0000001"}, "value": [120, "1"]}]}',
+        [["[('value','0.0000001')]", "1970-01-01 00:02:00.000", 1]],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", vector(1e21))',
+        120,
+        '{"resultType": "vector", "result": [{"metric": {"value": "1000000000000000000000"}, "value": [120, "1"]}]}',
+        [["[('value','1000000000000000000000')]", "1970-01-01 00:02:00.000", 1]],
+    )
+
+    do_unordered_query_test(
+        'count_values("value", nonexistent_metric)',
+        120,
+        '{"resultType": "vector", "result": []}',
+        [],
     )
 
     do_query_test(
